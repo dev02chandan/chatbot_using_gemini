@@ -32,6 +32,8 @@ if __name__ == "__main__":
     # print(results)
     print("Distances:", results["distances"][0])
     print("Titles:", results["metadatas"][0])
+    # print("Documents", results["documents"][0])
+    print(results)
     # Get the total number of chunks by querying the collection for all documents
     all_documents = collection.get()
     num_chunks = len(all_documents["documents"])

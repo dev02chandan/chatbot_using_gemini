@@ -4,58 +4,45 @@ import os
 import numpy as np
 import pandas as pd
 import textwrap
+import chromadb
 
 # App title and configuration
-st.set_page_config(page_title="Maitri AI Chatbot")
+st.set_page_config(page_title="ICICI ETF Knowledge Center Chatbot")
 
-# Configure Gemini API
-if "GEMINI_API_KEY" in st.secrets:
-    gemini_api = st.secrets["GEMINI_API_KEY"]
-else:
-    gemini_api = st.text_input(
-        "Enter Gemini API token:", type="password", key="api_input"
-    )
-    if gemini_api and gemini_api.startswith("r8_") and len(gemini_api) == 40:
-        st.secrets["GEMINI_API_KEY"] = gemini_api
-        st.experimental_rerun()
+# Set the API
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    raise ValueError("GEMINI_API_KEY environment variable not set.")
 
-if "GEMINI_API_KEY" in st.secrets:
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    hide_sidebar = True
-else:
-    st.sidebar.write("Please enter your API key")
-    hide_sidebar = False
-
-# Hide sidebar if API key is set
-if hide_sidebar:
-    st.markdown(
-        """
-        <style>
-        [data-testid="stSidebar"] {
-            display: none;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+genai.configure(api_key=api_key)
 
 # Add logo
 logo_path = "logo.png"
 if os.path.exists(logo_path):
     st.image(logo_path, width=200)
+st.title("ICICI ETF Knowledge Center Chatbot")
 
-# Load the dataframe with precomputed embeddings
-df = pd.read_feather("data_v2_with_embeddings.feather")
+# Initialize Chroma Client
+chroma_client = chromadb.PersistentClient(path="db/")
+
+# Retrieve the collection
+try:
+    collection = chroma_client.get_collection(name="icici_etf_articles")
+except chromadb.errors.InvalidCollectionException:
+    print(
+        "Collection 'icici_etf_articles' does not exist. Please check your database setup."
+    )
+    exit()
 
 
-# Function to find the best passages
-def find_best_passages(query, dataframe, top_n=3):
-    query_embedding = genai.embed_content(
-        model="models/text-embedding-004", content=query
-    )["embedding"]
-    dot_products = np.dot(np.stack(dataframe["Embeddings"]), query_embedding)
-    top_indices = np.argsort(dot_products)[-top_n:][::-1]
-    return dataframe.iloc[top_indices]["Text"].tolist()
+# Query the Database
+def query_database(user_query, n_results=5):
+    """Query the Chroma database with a user query."""
+    results = collection.query(
+        query_texts=[user_query],  # The query string
+        n_results=n_results,  # Number of results to retrieve
+    )
+    return results
 
 
 # Function to make prompt
@@ -69,19 +56,18 @@ def make_prompt(query, relevant_passages):
     )
     prompt = textwrap.dedent(
         f"""
-    Persona: You are Maitri AI Chatbot, representing MaitriAI, a leading software company specializing in web application development, website design, logo design, software development, and cutting-edge AI applications. You are knowledgeable, formal, and detailed in your responses.
+        Persona: You are the ICICI ETF Chatbot, an expert on Exchange-Traded Funds (ETFs) offered by ICICI. Your role is to assist users in understanding the various ETF products, how to invest, market trends, sector-specific ETFs, and more. You provide insightful, precise, and professional responses to all ETF-related inquiries.
 
-    Task: Answer questions about Maitri AI, its services, and related information. Provide detailed and kind responses in a conversational manner.  If the context is relevant to the query, use it to give a comprehensive answer. If the context is not relevant, acknowledge that you do not know the answer. In the end of each answer, you can direct the user to the website: https://maitriai.com/contact-us/, Whatsapp number: 9022049092.
+        Task: Answer questions related to ICICI ETFs, their benefits, investment strategies, market performance, and the process of purchasing and managing ETFs. Ensure your responses are informative, concise, and easy to understand. If a query pertains to something outside the scope of ETFs or ICICI's offerings, or the context provided to you, kindly inform the user that you do not have that information.
 
-    Format: Respond in a formal and elaborate manner, providing as much relevant information as possible. If you do not know the answer, respond by saying you do not know. The response should be in plain text without any formatting.
+        Format: Your answers should be clear, professional, and tailored to the needs of both beginner and experienced investors. Provide as much relevant information as possible, explaining technical terms when necessary.s
 
-    Context: {joined_passages}
+        Context: {joined_passages}
 
-    QUESTION: '{query}'
-    
+        QUESTION: '{query}'
 
-    ANSWER:
-    """
+        ANSWER:
+        """
     )
     return prompt
 
@@ -90,22 +76,24 @@ def make_prompt(query, relevant_passages):
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {
-            "role": "assistant",
-            "content": "Welcome to Maitri AI Chatbot! How can I assist you with information about Maitri AI today?",
+            "role": "model",
+            "parts": "Welcome to Maitri AI Chatbot! How can I assist you with information about Maitri AI today?",
         }
     ]
 
 # Display or clear chat messages
 for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
+    with st.chat_message(
+        "assistant" if message["role"] == "model" else message["role"]
+    ):
+        st.write(message["parts"])
 
 
 def clear_chat_history():
     st.session_state.messages = [
         {
-            "role": "assistant",
-            "content": "Welcome to Maitri AI Chatbot! How can I assist you with information about Maitri AI today?",
+            "role": "model",
+            "parts": "Welcome to Maitri AI Chatbot! How can I assist you with information about Maitri AI today?",
         }
     ]
 
@@ -115,26 +103,55 @@ st.sidebar.button("Clear Chat History", on_click=clear_chat_history)
 
 # Function for generating Gemini response
 def generate_gemini_response(query):
-    relevant_passages = find_best_passages(query, df)
-    prompt = make_prompt(query, relevant_passages)
-    response = genai.GenerativeModel("models/gemini-1.5-flash-latest").generate_content(
-        prompt
+    """Generate a Gemini response to a user query."""
+
+    # First get relevant documents from the database
+    results = query_database(query, 5)
+
+    # Print the retrieved documents for verification
+    print("===Verification of Retreived Documents: ===\n")
+    print("\nDistances: ", results["distances"][0])
+    print("\nTitles:", results["metadatas"][0])
+    print("\nSnippets: ")
+    for i in results["documents"][0]:
+        print("\n", i[100:])
+    print("\n===End of Verification===")
+
+    # Generate a prompt for the model
+    prompt = make_prompt(query, results["documents"][0])
+
+    # Defining Model
+    model = genai.GenerativeModel("models/gemini-1.5-flash")
+
+    # Start chat with history form streamlit session state
+    chat = model.start_chat(
+        history=[
+            {"role": msg["role"], "parts": msg["parts"]}
+            for msg in st.session_state.messages
+        ]
     )
+
+    # Generate response
+    response = chat.send_message(prompt)
+
     return response.text
 
 
 # User-provided prompt
-if prompt := st.chat_input(disabled=not gemini_api):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+if prompt := st.chat_input():
+    st.session_state.messages.append({"role": "user", "parts": prompt})
     with st.chat_message("user"):
         st.write(prompt)
 
-# Generate a new response if last message is not from assistant
-if st.session_state.messages[-1]["role"] != "assistant":
+# Initialize response variable
+response = ""
+
+# Generate a new response if last message is not from model
+if st.session_state.messages[-1]["role"] != "model":
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             response = generate_gemini_response(prompt)
             placeholder = st.empty()
             placeholder.markdown(response)
-    message = {"role": "assistant", "content": response}
+    message = {"role": "model", "parts": response}
     st.session_state.messages.append(message)
